@@ -1,6 +1,7 @@
 using Comfort.Common;
 using DrakiaXYZ.BigBrain.Brains;
 using EFT;
+using EFT.Interactive;
 using System;
 using System.Collections.Generic;
 using System.Reflection;
@@ -11,10 +12,13 @@ namespace ScavTaskMod
 {
     public enum ScavTaskType
     {
-        None        = 0,
-        SpawnRush   = 1,   // идти к месту спавна игрока и убить его при встрече
-        HuntBoss    = 2,   // обыскивать споты спавна босса
-        CheckPMCSpawn = 3  // проверить ближайший спавн PMC
+        None          = 0,
+        SpawnRush     = 1,  // идти к месту спавна игрока и убить его при встрече
+        HuntBoss      = 2,  // обыскивать споты спавна босса
+        CheckPMCSpawn = 3,  // проверить ближайший спавн PMC
+        EftVisit      = 4,  // реальный квест EFT: посетить зону
+        EftKill       = 5,  // реальный квест EFT: убить PMC или босса
+        EftFind       = 6   // реальный квест EFT: найти предмет
     }
 
     public class ScavTaskData : CustomLayer.ActionData
@@ -23,9 +27,17 @@ namespace ScavTaskMod
         public Vector3      TargetPos;
         public bool         HasTarget;
         // Для HuntBoss — sub-state
-        public bool         Searching;     // true = уже прибыли, обыскиваем
-        public float        SearchUntil;   // Time.time до которого ищем
-        public Vector3      SearchCenter;  // центр зоны поиска
+        public bool         Searching;
+        public float        SearchUntil;
+        public Vector3      SearchCenter;
+
+        // EftVisit — id квестовой зоны
+        public string            EftZoneId;
+        // EftKill — тип цели
+        public EftKillTargetType EftKillTarget;
+        public string            EftBossRole;
+        // EftFind — ссылка на задачу (позиции лута)
+        public EftFindTask       EftFindRef;
     }
 
     public class ScavTaskLayer : CustomLayer
@@ -55,6 +67,13 @@ namespace ScavTaskMod
         private static List<Vector3> _bossSpawnZones = null;
         public  static bool          NoBossOnMap     = false;
 
+        // Кеш статических мин для проверки безопасности пути
+        private static MineDirectional[] _cachedMines    = null;
+        private static float             _minesCheckTime = 0f;
+        private const  float             MINES_CACHE_TTL = 60f;
+        private const  float             MINE_DANGER_SQR = 16f;  // 4 м radius
+        private const  float             MAX_PATH_LENGTH = 1500f; // макс длина маршрута в метрах
+
         // ── Путь бота и история задач (для оверлея) ───────────────────
         // Bot id → список записанных позиций
         public static readonly Dictionary<int, List<Vector3>> BotPaths =
@@ -82,6 +101,20 @@ namespace ScavTaskMod
         private float   _taskTimeout    = 0f;
         private const float TASK_TIMEOUT = 90f;
 
+        // Если TryFindTarget возвращает false дольше этого — досрочно бросаем задание
+        private float _noTargetSince     = 0f;
+        private bool  _noTargetTracking  = false;
+        private const float NO_TARGET_ABANDON = 20f;
+
+        // ── Текущие EFT квест-задания (одно на тип, null = не назначено) ──
+        private EftVisitTask _currentEftVisit = null;
+        private EftKillTask  _currentEftKill  = null;
+        private EftFindTask  _currentEftFind  = null;
+
+        // EftKill: подтверждение убийства через Player.OnPlayerDead
+        private bool              _killConfirmed = false;
+        private readonly List<Player> _trackedPMCs = new List<Player>();
+
         // ── BigBrain init ──────────────────────────────────────────────
         public ScavTaskLayer(BotOwner botOwner, int priority) : base(botOwner, priority)
         {
@@ -101,7 +134,23 @@ namespace ScavTaskMod
         public override bool IsActive()
         {
             if (BotOwner == null || BotOwner.IsDead) return false;
-            if (IsBotInCombat())                     return false;
+
+            // EftKill: если убийство подтверждено — завершаем задание сразу (даже если были в бою)
+            if (_task == ScavTaskType.EftKill && _killConfirmed)
+            {
+                ScavTaskPlugin.Log.LogInfo(
+                    $"[ScavTaskMod] [{BotOwner.Id}] EftKill: kill confirmed → completing");
+                MarkTaskComplete();
+                return false;
+            }
+
+            if (IsBotInCombat())
+            {
+                // EftKill: сбрасываем таймаут пока бот в бою — квест не должен истечь во время боя
+                if (_task == ScavTaskType.EftKill)
+                    _taskTimeout = Time.time + TASK_TIMEOUT;
+                return false;
+            }
 
             if (BotOwner.Medecine.FirstAid.Have2Do ||
                 BotOwner.Medecine.SurgicalKit.HaveWork)
@@ -124,8 +173,13 @@ namespace ScavTaskMod
                 _hasCachedTarget = false;
                 _hasFixedTarget  = false;   // сброс фиксированной цели при новом задании
                 _taskTimeout     = Time.time + TASK_TIMEOUT;
+                _noTargetTracking = false;  // сброс счётчика отсутствия цели
 
-                if (_task == ScavTaskType.None) return false;
+                if (_task == ScavTaskType.None)
+                {
+                    _cooldownUntil = Time.time + 5f;  // не спамим каждый кадр если нет задач
+                    return false;
+                }
 
                 ScavTaskPlugin.Log.LogInfo(
                     $"[ScavTaskMod] [{BotOwner.Id}] assigned task: {_task}");
@@ -141,7 +195,24 @@ namespace ScavTaskMod
             }
 
             Vector3 foundTarget;
-            if (!TryFindTarget(out foundTarget)) return false;
+            if (!TryFindTarget(out foundTarget))
+            {
+                // Досрочно бросаем задание если нет цели дольше NO_TARGET_ABANDON секунд.
+                // Это предотвращает зависание бота на месте при EftKill/EftFind без целей.
+                if (!_noTargetTracking)
+                {
+                    _noTargetTracking = true;
+                    _noTargetSince    = Time.time;
+                }
+                else if (Time.time - _noTargetSince > NO_TARGET_ABANDON)
+                {
+                    ScavTaskPlugin.Log.LogWarning(
+                        $"[ScavTaskMod] [{BotOwner.Id}] task {_task}: no target for {NO_TARGET_ABANDON}s → abandon");
+                    MarkTaskComplete();
+                }
+                return false;
+            }
+            _noTargetTracking = false;  // цель найдена — сбрасываем счётчик
 
             return true;
         }
@@ -159,8 +230,17 @@ namespace ScavTaskMod
                     new ScavTaskData { TaskType = _task, HasTarget = false });
             }
 
-            return new CustomLayer.Action(typeof(ScavTaskLogic), _task.ToString(),
-                new ScavTaskData { TaskType = _task, TargetPos = target, HasTarget = true });
+            var actionData = new ScavTaskData { TaskType = _task, TargetPos = target, HasTarget = true };
+            if (_task == ScavTaskType.EftKill && _currentEftKill != null)
+            {
+                actionData.EftKillTarget = _currentEftKill.TargetType;
+                actionData.EftBossRole   = _currentEftKill.BossRole;
+            }
+            else if (_task == ScavTaskType.EftFind && _currentEftFind != null)
+            {
+                actionData.EftFindRef = _currentEftFind;
+            }
+            return new CustomLayer.Action(typeof(ScavTaskLogic), _task.ToString(), actionData);
         }
 
         // ── IsCurrentActionEnding ─────────────────────────────────────
@@ -179,7 +259,12 @@ namespace ScavTaskMod
             }
 
             float dist = Vector3.Distance(BotOwner.Position, target);
-            if (dist <= REACH_DIST && _task != ScavTaskType.HuntBoss)
+            // EftVisit/EftFind/EftKill завершаются из Logic после отработки таймера/поиска
+            bool distCompletes = _task != ScavTaskType.HuntBoss
+                              && _task != ScavTaskType.EftVisit
+                              && _task != ScavTaskType.EftFind
+                              && _task != ScavTaskType.EftKill;
+            if (dist <= REACH_DIST && distCompletes)
             {
                 ScavTaskPlugin.Log.LogInfo(
                     $"[ScavTaskMod] [{BotOwner.Id}] reached target dist={dist:F1}m → completing task={_task}");
@@ -200,6 +285,8 @@ namespace ScavTaskMod
         // ── MarkTaskComplete (вызывается из Logic) ────────────────────
         public void MarkTaskComplete()
         {
+            StopKillTracking();   // снимаем подписку OnPlayerDead если была
+
             ScavTaskPlugin.Log.LogInfo(
                 $"[ScavTaskMod] [{BotOwner.Id}] MarkTaskComplete: task was {_task}");
 
@@ -215,6 +302,12 @@ namespace ScavTaskMod
             if (_task == ScavTaskType.SpawnRush &&
                 _spawnRushOwnerBotId == BotOwner.Id)
                 _spawnRushOwnerBotId = -1;
+
+            // Освобождаем EFT задания чтобы другие боты могли их взять
+            EftQuestTaskManager.ReleaseTasksForBot(BotOwner.Id);
+            _currentEftVisit = null;
+            _currentEftKill  = null;
+            _currentEftFind  = null;
 
             _taskComplete    = true;
             _task            = ScavTaskType.None;
@@ -275,6 +368,15 @@ namespace ScavTaskMod
                 case ScavTaskType.CheckPMCSpawn:
                     found = TryGetPMCTarget(out target);
                     break;
+                case ScavTaskType.EftVisit:
+                    found = TryGetEftVisitTarget(out target);
+                    break;
+                case ScavTaskType.EftKill:
+                    found = TryGetEftKillTarget(out target);
+                    break;
+                case ScavTaskType.EftFind:
+                    found = TryGetEftFindTarget(out target);
+                    break;
             }
 
             if (found)
@@ -333,6 +435,8 @@ namespace ScavTaskMod
                 if (otherDist < myDist) return false;
             }
 
+            if (!IsPathSafe(spawnNavPos)) return false;
+
             _spawnRushOwnerBotId = BotOwner.Id;
             pos = spawnNavPos;
             return true;
@@ -353,9 +457,9 @@ namespace ScavTaskMod
             // Чистим просроченные записи
             _searchedBossAreas.RemoveAll(e => Time.time > e.expiry);
 
-            // Ищем ближайшую необысканную зону
-            Vector3 nearest    = Vector3.zero;
-            float   nearestDist = float.MaxValue;
+            Vector3 nearest      = Vector3.zero;
+            float   nearestDist  = float.MaxValue;
+            bool    anyUnsearched = false;
 
             foreach (var zonePos in _bossSpawnZones)
             {
@@ -365,22 +469,32 @@ namespace ScavTaskMod
                     { searched = true; break; }
                 if (searched) continue;
 
-                float d = Vector3.Distance(BotOwner.Position, zonePos);
-                if (d < nearestDist) { nearestDist = d; nearest = zonePos; }
+                anyUnsearched = true;
+
+                // Snap на NavMesh перед проверкой безопасности
+                NavMeshHit hit;
+                Vector3 snapPos = NavMesh.SamplePosition(zonePos, out hit, 15f, NavMesh.AllAreas)
+                    ? hit.position : zonePos;
+
+                if (!IsPathSafe(snapPos)) continue;
+
+                float d = Vector3.Distance(BotOwner.Position, snapPos);
+                if (d < nearestDist) { nearestDist = d; nearest = snapPos; }
             }
 
             if (nearest == Vector3.zero)
             {
-                // Все зоны обысканы — босса нет на карте, квест больше не выдаём
-                NoBossOnMap = true;
-                ScavTaskPlugin.Log.LogInfo("[ScavTaskMod] Все зоны боссов обысканы — босса нет на карте");
+                // Объявляем NoBossOnMap только если реально все зоны обысканы,
+                // а не просто недоступны по пути
+                if (!anyUnsearched)
+                {
+                    NoBossOnMap = true;
+                    ScavTaskPlugin.Log.LogInfo("[ScavTaskMod] Все зоны боссов обысканы — босса нет на карте");
+                }
                 return false;
             }
 
-            NavMeshHit hit;
-            pos = NavMesh.SamplePosition(nearest, out hit, 15f, NavMesh.AllAreas)
-                ? hit.position
-                : nearest;
+            pos = nearest;
             return true;
         }
 
@@ -439,18 +553,23 @@ namespace ScavTaskMod
 
             // CheckPMCSpawn только если PMC в радиусе 200м
             if (closestPMC == null || closestDist > 200f)
-            {
-                ScavTaskPlugin.Log.LogDebug(
-                    $"[ScavTaskMod] [{BotOwner.Id}] CheckPMC fail: totalAI={totalAI} pmcs={pmcFound} closestDist={closestDist:F0}m");
                 return false;
-            }
 
-            // Snap на NavMesh и сразу фиксируем — больше не обновляем
+            // Snap на NavMesh
             NavMeshHit hit;
             pos = NavMesh.SamplePosition(closestPMC.Position, out hit, 10f, NavMesh.AllAreas)
                 ? hit.position
                 : closestPMC.Position;
 
+            // Проверяем доступность пути до PMC
+            if (!IsPathSafe(pos))
+            {
+                ScavTaskPlugin.Log.LogDebug(
+                    $"[ScavTaskMod] [{BotOwner.Id}] CheckPMC: path to {pos} unsafe → skip");
+                return false;
+            }
+
+            // Фиксируем цель — больше не обновляем
             _fixedTarget    = pos;
             _hasFixedTarget = true;
             ScavTaskPlugin.Log.LogInfo(
@@ -458,27 +577,319 @@ namespace ScavTaskMod
             return true;
         }
 
+        // ── EFT квест: посетить зону ──────────────────────────────────
+        private bool TryGetEftVisitTarget(out Vector3 pos)
+        {
+            pos = Vector3.zero;
+            if (!EftQuestTaskManager.IsInitialized) return false;
+
+            if (_currentEftVisit == null)
+            {
+                if (!EftQuestTaskManager.TryGetVisitTask(BotOwner.Position, BotOwner.Id, out _currentEftVisit))
+                    return false;
+
+                // Проверяем доступность зоны при первом назначении
+                NavMeshHit checkHit;
+                Vector3 checkPos = NavMesh.SamplePosition(_currentEftVisit.ZonePosition, out checkHit, 15f, NavMesh.AllAreas)
+                    ? checkHit.position : _currentEftVisit.ZonePosition;
+
+                if (!IsPathSafe(checkPos))
+                {
+                    ScavTaskPlugin.Log.LogDebug(
+                        $"[ScavTaskMod] EftVisit zone '{_currentEftVisit.ZoneId}' unreachable → blocked globally");
+                    EftQuestTaskManager.BlockedVisitZoneIds.Add(_currentEftVisit.ZoneId);
+                    EftQuestTaskManager.ReleaseTasksForBot(BotOwner.Id);
+                    _currentEftVisit = null;
+                    return false;
+                }
+            }
+
+            NavMeshHit hit;
+            pos = NavMesh.SamplePosition(_currentEftVisit.ZonePosition, out hit, 15f, NavMesh.AllAreas)
+                ? hit.position
+                : _currentEftVisit.ZonePosition;
+            return pos != Vector3.zero;
+        }
+
+        // ── EFT квест: убить цель ─────────────────────────────────────
+        // PMC  → динамически ищем ближайшего живого PMC каждые TARGET_UPDATE_INT сек
+        // Boss → идти к зонам спавна босса (как HuntBoss)
+        private bool TryGetEftKillTarget(out Vector3 pos)
+        {
+            pos = Vector3.zero;
+            if (!EftQuestTaskManager.IsInitialized) return false;
+
+            if (_currentEftKill == null)
+            {
+                if (!EftQuestTaskManager.TryGetKillTask(BotOwner.Id, out _currentEftKill))
+                    return false;
+                StartKillTracking();
+                ScavTaskPlugin.Log.LogInfo(
+                    $"[ScavTaskMod] [{BotOwner.Id}] EftKill: quest='{_currentEftKill.QuestName}' type={_currentEftKill.TargetType}");
+            }
+
+            return _currentEftKill.TargetType == EftKillTargetType.Boss
+                ? TryGetHuntBossTarget(out pos)
+                : TryGetDynamicPMCTarget(out pos);
+        }
+
+        // Динамический поиск PMC — без фиксации, обновляется через кеш (TARGET_UPDATE_INT)
+        private bool TryGetDynamicPMCTarget(out Vector3 pos)
+        {
+            pos = Vector3.zero;
+            var gw = Singleton<GameWorld>.Instance;
+            if (gw?.AllAlivePlayersList == null) return false;
+
+            Player nearest    = null;
+            float nearestDist = float.MaxValue;
+
+            foreach (var player in gw.AllAlivePlayersList)
+            {
+                if (player == null || !player.HealthController.IsAlive) continue;
+
+                bool isTarget = !player.IsAI; // живой PMC-игрок
+                if (!isTarget && player.IsAI)
+                {
+                    var bo = player.AIData?.BotOwner;
+                    if (bo != null && IsPMCRole(
+                            bo.Profile?.Info?.Settings?.Role ?? WildSpawnType.assault))
+                        isTarget = true;
+                }
+                if (!isTarget) continue;
+
+                float d = Vector3.Distance(BotOwner.Position, player.Position);
+                if (d < nearestDist) { nearestDist = d; nearest = player; }
+            }
+
+            if (nearest == null) return false;
+
+            NavMeshHit hit;
+            pos = NavMesh.SamplePosition(nearest.Position, out hit, 10f, NavMesh.AllAreas)
+                ? hit.position
+                : nearest.Position;
+            return pos != Vector3.zero;
+        }
+
+        // ── EftKill: подписка на Player.OnPlayerDead для всех живых PMC ──
+        private void StartKillTracking()
+        {
+            StopKillTracking();
+            var gw = Singleton<GameWorld>.Instance;
+            if (gw?.AllAlivePlayersList == null) return;
+
+            foreach (var player in gw.AllAlivePlayersList)
+            {
+                if (player == null || !player.HealthController.IsAlive) continue;
+
+                bool isTarget = !player.IsAI;
+                if (!isTarget && player.IsAI)
+                {
+                    var bo = player.AIData?.BotOwner;
+                    if (bo != null && IsPMCRole(
+                            bo.Profile?.Info?.Settings?.Role ?? WildSpawnType.assault))
+                        isTarget = true;
+                }
+                if (!isTarget) continue;
+
+                player.OnPlayerDead += OnTrackedPlayerDead;
+                _trackedPMCs.Add(player);
+            }
+
+            ScavTaskPlugin.Log.LogInfo(
+                $"[ScavTaskMod] [{BotOwner.Id}] EftKill: tracking {_trackedPMCs.Count} PMC targets");
+        }
+
+        private void StopKillTracking()
+        {
+            foreach (var p in _trackedPMCs)
+                if (p != null) p.OnPlayerDead -= OnTrackedPlayerDead;
+            _trackedPMCs.Clear();
+            _killConfirmed = false;
+        }
+
+        private void OnTrackedPlayerDead(Player player, IPlayer lastAggressor,
+            DamageInfoStruct dmg, EBodyPart part)
+        {
+            if (player != null)
+                player.OnPlayerDead -= OnTrackedPlayerDead;
+            _trackedPMCs.Remove(player);
+
+            // Проверяем что убийца — именно наш бот
+            if (lastAggressor?.ProfileId == BotOwner.ProfileId)
+            {
+                _killConfirmed = true;
+                ScavTaskPlugin.Log.LogInfo(
+                    $"[ScavTaskMod] [{BotOwner.Id}] EftKill: killed '{player?.name}' → quest will complete");
+            }
+        }
+
+        // ── EFT квест: найти предмет ──────────────────────────────────
+        private bool TryGetEftFindTarget(out Vector3 pos)
+        {
+            pos = Vector3.zero;
+            if (!EftQuestTaskManager.IsInitialized) return false;
+
+            if (_currentEftFind == null)
+            {
+                if (!EftQuestTaskManager.TryGetFindTask(BotOwner.Position, BotOwner.Id, out _currentEftFind))
+                    return false;
+            }
+
+            // Освежаем позиции лута если нужно
+            EftQuestTaskManager.RefreshLootPositions();
+            if (_currentEftFind.LootPositions.Count == 0) return false;
+
+            // Ближайшая позиция лута
+            Vector3 nearest    = Vector3.zero;
+            float   nearestDst = float.MaxValue;
+            foreach (var lp in _currentEftFind.LootPositions)
+            {
+                float d = Vector3.Distance(BotOwner.Position, lp);
+                if (d < nearestDst) { nearestDst = d; nearest = lp; }
+            }
+            if (nearest == Vector3.zero) return false;
+
+            NavMeshHit hit;
+            pos = NavMesh.SamplePosition(nearest, out hit, 15f, NavMesh.AllAreas)
+                ? hit.position
+                : nearest;
+            return pos != Vector3.zero;
+        }
+
+        // ── Вспомогательные счётчики (используются в PickBestTask) ───
+        // Количество живых Скавов с нашим слоем (основа для расчёта квот)
+        private static int CountAliveScavsInLayer()
+        {
+            int n = 0;
+            foreach (var kv in LayersByBotId)
+                if (kv.Value?.BotOwner != null && !kv.Value.BotOwner.IsDead) n++;
+            return Mathf.Max(1, n);
+        }
+
+        // Сколько ботов сейчас активно выполняют данный тип задания
+        private static int CountActiveTaskType(ScavTaskType type)
+        {
+            int n = 0;
+            foreach (var kv in LayersByBotId)
+            {
+                var l = kv.Value;
+                if (l?.BotOwner != null && !l.BotOwner.IsDead && l.CurrentTask == type) n++;
+            }
+            return n;
+        }
+
         // ── Выбор лучшего задания ─────────────────────────────────────
         private ScavTaskType PickBestTask()
         {
-            // 1. SpawnRush — если спавн известен и никто не взял
             Vector3 tmp;
+
+            // 1. SpawnRush — один бот, реакция на спавн игрока
             _task = ScavTaskType.SpawnRush;
             if (TryGetSpawnRushTarget(out tmp))
                 return ScavTaskType.SpawnRush;
 
-            // 2. CheckPMCSpawn — если PMC рядом
-            _task = ScavTaskType.CheckPMCSpawn;
-            if (TryGetPMCTarget(out tmp))
-                return ScavTaskType.CheckPMCSpawn;
+            // Квоты пропорционально живым Скавам:
+            //   alive=12 → Visit≤4, Kill≤2, Find≤2 — остальные ~4 бота на PMC/Boss
+            int alive    = CountAliveScavsInLayer();
+            int visitCap = Mathf.Max(2, alive / 3);  // ~33%
+            int killCap  = Mathf.Max(1, alive / 5);  // ~20%
+            int findCap  = Mathf.Max(1, alive / 5);  // ~20%
 
-            // 3. HuntBoss — если есть необысканные зоны спавна босса
+            if (EftQuestTaskManager.IsInitialized)
+            {
+                // Счёт идёт ДО установки _task — текущий бот не попадает в счётчик
+                if (CountActiveTaskType(ScavTaskType.EftVisit) < visitCap)
+                {
+                    _task = ScavTaskType.EftVisit;
+                    if (TryGetEftVisitTarget(out tmp)) return ScavTaskType.EftVisit;
+                }
+
+                if (CountActiveTaskType(ScavTaskType.EftKill) < killCap)
+                {
+                    _task = ScavTaskType.EftKill;
+                    if (TryGetEftKillTarget(out tmp)) return ScavTaskType.EftKill;
+                }
+
+                if (CountActiveTaskType(ScavTaskType.EftFind) < findCap)
+                {
+                    _task = ScavTaskType.EftFind;
+                    if (TryGetEftFindTarget(out tmp)) return ScavTaskType.EftFind;
+                }
+            }
+
+            // Боты вне EFT-квоты → CheckPMCSpawn / HuntBoss
+            _task = ScavTaskType.CheckPMCSpawn;
+            if (TryGetPMCTarget(out tmp)) return ScavTaskType.CheckPMCSpawn;
+
             _task = ScavTaskType.HuntBoss;
-            if (TryGetHuntBossTarget(out tmp))
-                return ScavTaskType.HuntBoss;
+            if (TryGetHuntBossTarget(out tmp)) return ScavTaskType.HuntBoss;
+
+            // PMC/Boss тоже нет — фолбэк на EFT без квоты
+            if (EftQuestTaskManager.IsInitialized)
+            {
+                _task = ScavTaskType.EftVisit;
+                if (TryGetEftVisitTarget(out tmp)) return ScavTaskType.EftVisit;
+
+                _task = ScavTaskType.EftFind;
+                if (TryGetEftFindTarget(out tmp)) return ScavTaskType.EftFind;
+            }
 
             _task = ScavTaskType.None;
             return ScavTaskType.None;
+        }
+
+        // ── Проверка безопасности пути ────────────────────────────────
+        // Возвращает false если NavMesh не строит полный путь, путь слишком длинный
+        // или рядом с сегментами пути находится статическая мина.
+        private bool IsPathSafe(Vector3 dest)
+        {
+            // 1. NavMesh: путь должен быть полным (PathComplete)
+            var navPath = new NavMeshPath();
+            if (!NavMesh.CalculatePath(BotOwner.Position, dest, NavMesh.AllAreas, navPath))
+                return false;
+            if (navPath.status != NavMeshPathStatus.PathComplete)
+                return false;
+
+            // 2. Длина пути — не идём слишком далеко
+            var corners  = navPath.corners;
+            float totalLen = 0f;
+            for (int i = 1; i < corners.Length; i++)
+                totalLen += Vector3.Distance(corners[i - 1], corners[i]);
+            if (totalLen > MAX_PATH_LENGTH) return false;
+
+            // 3. Статические мины вдоль маршрута (кеш обновляется раз в MINES_CACHE_TTL сек)
+            if (_cachedMines == null || Time.time > _minesCheckTime)
+            {
+                try   { _cachedMines = UnityEngine.Object.FindObjectsOfType<MineDirectional>(); }
+                catch { _cachedMines = new MineDirectional[0]; }
+                _minesCheckTime = Time.time + MINES_CACHE_TTL;
+            }
+
+            if (_cachedMines != null)
+            {
+                foreach (var mine in _cachedMines)
+                {
+                    if (mine == null) continue;
+                    Vector3 minePos = mine.transform.position;
+                    for (int i = 1; i < corners.Length; i++)
+                    {
+                        if (DistSqrPointSegment(minePos, corners[i - 1], corners[i]) < MINE_DANGER_SQR)
+                            return false;
+                    }
+                }
+            }
+
+            return true;
+        }
+
+        // Квадрат расстояния от точки P до отрезка AB
+        private static float DistSqrPointSegment(Vector3 p, Vector3 a, Vector3 b)
+        {
+            Vector3 ab    = b - a;
+            float   lenSqr = ab.sqrMagnitude;
+            if (lenSqr < 0.0001f) return (p - a).sqrMagnitude;
+            float t = Mathf.Clamp01(Vector3.Dot(p - a, ab) / lenSqr);
+            return (p - (a + t * ab)).sqrMagnitude;
         }
 
         // ── Проверка боя ──────────────────────────────────────────────

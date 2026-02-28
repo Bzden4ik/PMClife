@@ -30,6 +30,8 @@
     <!-- Исключаем дампы dnSpy и файлы шаблона из компиляции -->
     <Compile Remove="dnSpy\**" />
     <Compile Remove="ScavTask*.cs" />
+    <Compile Remove="EftQuestTask.cs" />
+    <Compile Remove="Reshala*.cs" />
     <Compile Remove="ExamplePatches\**" />
   </ItemGroup>
 

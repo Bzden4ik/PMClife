@@ -63,8 +63,26 @@ namespace ScavTaskMod
                 40,
                 new List<WildSpawnType> { WildSpawnType.assault }
             );
-
             Log.LogInfo("[ScavTaskMod] Layer registered for Assault brain (priority 40)");
+
+            // Решала (bossBully) — прячется, отстреливается, босс
+            // Приоритет 35: выше StandBy, ниже боевых слоёв EFT; SAIN перехватывает через return false
+            BrainManager.AddCustomLayer(
+                typeof(ReshalaBossLayer),
+                new List<string> { "BossBully", "bossBully" },
+                35,
+                new List<WildSpawnType> { WildSpawnType.bossBully }
+            );
+            Log.LogInfo("[ScavTaskMod] ReshalaBossLayer registered (priority 35)");
+
+            // Свита Решалы (followerBully) — периметр / давление / охота на убийцу
+            BrainManager.AddCustomLayer(
+                typeof(ReshalaGuardLayer),
+                new List<string> { "FollowerBully", "followerBully" },
+                35,
+                new List<WildSpawnType> { WildSpawnType.followerBully }
+            );
+            Log.LogInfo("[ScavTaskMod] ReshalaGuardLayer registered (priority 35)");
         }
 
         private void Start()
@@ -75,7 +93,10 @@ namespace ScavTaskMod
         // Ждём начала рейда и захватываем позицию спавна игрока
         private IEnumerator CapturePlayerSpawn()
         {
+            // Сброс состояния при старте нового рейда
             ScavTaskLayer.PlayerSpawnKnown = false;
+            ScavTaskLayer.NoBossOnMap      = false;
+            ReshalaShared.Reset();
 
             // Ждём пока загрузится GameWorld с игроком
             while (true)
@@ -97,7 +118,16 @@ namespace ScavTaskMod
                 ScavTaskLayer.PlayerSpawnPos   = world.MainPlayer.Position;
                 ScavTaskLayer.PlayerSpawnKnown = true;
                 Log.LogInfo($"[ScavTaskMod] Player spawn captured: {ScavTaskLayer.PlayerSpawnPos}");
+
+                // Карта и игрок готовы — инициализируем EFT-квесты
+                EftQuestTaskManager.Initialize();
+                Log.LogInfo("[ScavTaskMod] EftQuestTaskManager initialized");
             }
+        }
+
+        private void Update()
+        {
+            EftQuestTaskManager.Tick();
         }
     }
 
