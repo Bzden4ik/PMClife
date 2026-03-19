@@ -13,6 +13,11 @@ namespace LifePMC
         // ── Саб-точки ────────────────────────────────────────────────────────────
         public static ConfigEntry<float> SubPointWaitTime;
 
+        // ── Взаимодействия ───────────────────────────────────────────────────────
+        public static ConfigEntry<float> InteractChance;
+        public static ConfigEntry<int>   MaxInteractBots;
+        public static ConfigEntry<float> MaxInteractDist;
+
         // ── Лимиты ──────────────────────────────────────────────────────────────
         public static ConfigEntry<int> MaxStuck;
 
@@ -35,6 +40,24 @@ namespace LifePMC
 
             SubPointWaitTime = cfg.Bind(T, "Время ожидания на саб-точке (сек)", 15f,
                 "Сколько секунд бот стоит на каждой саб-точке если у неё wait_time = 0");
+
+            const string I = "LifePMC | Взаимодействия";
+            InteractChance = cfg.Bind(I, "Шанс посетить рубильник (0-1)", 0.5f,
+                new BepInEx.Configuration.ConfigDescription(
+                    "Вероятность (0.0–1.0) что бот посетит точку взаимодействия перед первым заданием. " +
+                    "0 = никогда, 1 = всегда (если есть точки).",
+                    new BepInEx.Configuration.AcceptableValueRange<float>(0f, 1f)));
+
+            MaxInteractBots = cfg.Bind(I, "Макс. ботов на одну точку", 2,
+                new BepInEx.Configuration.ConfigDescription(
+                    "Сколько ботов одновременно могут идти к одной interact-точке. " +
+                    "Остальные пропускают её и идут к обычным заданиям.",
+                    new BepInEx.Configuration.AcceptableValueRange<int>(1, 10)));
+
+            MaxInteractDist = cfg.Bind(I, "Макс. дистанция до точки (м)", 600f,
+                new BepInEx.Configuration.ConfigDescription(
+                    "Боты дальше этого расстояния от interact-точки не будут к ней идти.",
+                    new BepInEx.Configuration.AcceptableValueRange<float>(50f, 2000f)));
 
             MaxStuck = cfg.Bind(L, "Макс. застреваний", 5,
                 "После N застреваний бот перестаёт выполнять задания на весь рейд");

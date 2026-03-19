@@ -57,7 +57,8 @@ namespace LifePMC
                 if (!PointLoader.IsLoaded)
                     return LogBlock("IsLoaded=false (ждём загрузки карты)");
 
-                if (PointLoader.GetPoints().Count == 0)
+                // Слой активен если есть хотя бы основные точки ИЛИ точки взаимодействия
+                if (PointLoader.GetPoints().Count == 0 && PointLoader.GetInteractPoints().Count == 0)
                     return LogBlock("нет точек для этой карты");
 
                 // ── Лимит застреваний ─────────────────────────────────────────────

@@ -30,6 +30,7 @@ namespace LifePMC
         // ── Фазы ──────────────────────────────────────────────────────────────
         private enum Phase
         {
+            Interact,  // Идём к точке взаимодействия и взаимодействуем
             Navigate,  // Бежим к основной точке
             Wander,    // Обходим саб-точки (или просто стоим) — ограничено по времени
             Done
@@ -44,6 +45,11 @@ namespace LifePMC
         // ── Время на точке ────────────────────────────────────────────────────
         private float _locationEndTime;   // когда уйти с точки
         private float _locationDuration;  // сколько секунд провести (для логов)
+
+        // ── Взаимодействие ────────────────────────────────────────────────────
+        private InteractPoint _interactPoint;
+        private bool          _interactDone;
+        private bool          _interactReserved; // слот зарезервирован этим ботом
 
         // ── Саб-точки ─────────────────────────────────────────────────────────
         private List<SubPoint> _subs;
@@ -87,40 +93,119 @@ namespace LifePMC
         {
             LayerMap.TryGetValue(BotOwner.name, out _layer);
 
-            _point = PointLoader.SelectPoint();
-            if (_point == null)
-            {
-                Log.LogWarning($"[LifePMC] {BotOwner.name} Start(): нет доступных точек!");
-                SetStatus("нет точек");
-                _phase = Phase.Done;
-                return;
-            }
+            _point = PointLoader.SelectPoint();  // может быть null если нет основных точек
 
-            _phase           = Phase.Navigate;
             _startTime       = Time.time;
             _lastPos         = BotOwner.Position;
             _lastPosTime     = Time.time;
             _lastGoToTime    = -999f;
             _lastDistLogTime = -999f;
-            _subs            = null;
-            _wanderTargetSet = false;
-            _waitingAtSub    = false;
+            _subs             = null;
+            _wanderTargetSet  = false;
+            _waitingAtSub     = false;
+            _interactDone     = false;
+            _interactReserved = false;
+
+            // ── Проверяем доступные точки взаимодействия ──────────────────────
+            var interactList = PointLoader.GetInteractPoints();
+            _interactPoint = null;
+            if (interactList.Count > 0)
+            {
+                // Если quest-точек нет — interact всегда обязателен (chance не применяем)
+                bool forceInteract = (_point == null);
+                if (forceInteract || UnityEngine.Random.value <= LifePMCConfig.InteractChance.Value)
+                {
+                    // Берём только те точки что в пределах MaxInteractDist,
+                    // сортируем по дистанции — ближайшие имеют приоритет в занятии слота.
+                    float maxDist = LifePMCConfig.MaxInteractDist.Value;
+                    var candidates = new List<InteractPoint>();
+                    foreach (var ip in interactList)
+                    {
+                        float d = Vector3.Distance(BotOwner.Position, ip.Position);
+                        if (d <= maxDist) candidates.Add(ip);
+                    }
+                    candidates.Sort((a, b) =>
+                        Vector3.Distance(BotOwner.Position, a.Position)
+                            .CompareTo(Vector3.Distance(BotOwner.Position, b.Position)));
+
+                    // Пробуем зарезервировать слот у ближайшей доступной точки
+                    foreach (var candidate in candidates)
+                    {
+                        if (PointLoader.TryReserveInteract(candidate.Id, BotOwner.name))
+                        {
+                            _interactPoint    = candidate;
+                            _interactReserved = true;
+                            break;
+                        }
+                    }
+
+                    if (_interactPoint == null && candidates.Count > 0)
+                        Log.LogInfo($"[LifePMC] {BotOwner.name} все слоты взаимодействия заняты " +
+                                    $"— иду к обычному заданию");
+                    else if (candidates.Count == 0 && interactList.Count > 0)
+                        Log.LogInfo($"[LifePMC] {BotOwner.name} нет interact-точек в радиусе " +
+                                    $"{maxDist:F0}м — иду к обычному заданию");
+                }
+            }
+
+            // Нет ни основных точек ни interact — завершаем сразу
+            if (_point == null && _interactPoint == null)
+            {
+                Log.LogWarning($"[LifePMC] {BotOwner.name} Start(): нет ни основных точек ни взаимодействий!");
+                SetStatus("нет точек");
+                _phase = Phase.Done;
+                return;
+            }
 
             BotOwner.Mover.SetTargetMoveSpeed(1f);
             BotOwner.Mover.Sprint(true);
 
-            float dist = Vector3.Distance(BotOwner.Position, _point.Position);
-            SetStatus($"→ {_point.ZoneName}");
+            if (_interactPoint != null)
+            {
+                _phase = Phase.Interact;
+                float idist = Vector3.Distance(BotOwner.Position, _interactPoint.Position);
+                SetStatus($"[!] {_interactPoint.Description}");
+                Log.LogInfo($"[LifePMC] ► {BotOwner.name} идёт к взаимодействию [{_interactPoint.Description}]");
+                Log.LogInfo($"[LifePMC]   Цель: ({_interactPoint.X:F1},{_interactPoint.Y:F1},{_interactPoint.Z:F1})  dist={idist:F1}м");
+            }
+            else
+            {
+                _phase = Phase.Navigate;
+            }
 
-            Log.LogInfo($"[LifePMC] ► {BotOwner.name} НАЧИНАЕТ движение к [{_point.ZoneName}]");
-            Log.LogInfo($"[LifePMC]   Цель: ({_point.X:F1}, {_point.Y:F1}, {_point.Z:F1})");
-            Log.LogInfo($"[LifePMC]   Дистанция: {dist:F1}м  |  WaitTime: {_point.WaitTime:F0}с");
-            Log.LogInfo($"[LifePMC]   Бот позиция: {BotOwner.Position}");
+            if (_point != null)
+            {
+                float dist = Vector3.Distance(BotOwner.Position, _point.Position);
+                SetStatus(_interactPoint != null ? $"[!] {_interactPoint.Description}" : $"→ {_point.ZoneName}");
+                Log.LogInfo($"[LifePMC] ► {BotOwner.name} НАЧИНАЕТ движение к [{_point.ZoneName}]");
+                Log.LogInfo($"[LifePMC]   Цель: ({_point.X:F1}, {_point.Y:F1}, {_point.Z:F1})");
+                Log.LogInfo($"[LifePMC]   Дистанция: {dist:F1}м  |  WaitTime: {_point.WaitTime:F0}с");
+                Log.LogInfo($"[LifePMC]   Бот позиция: {BotOwner.Position}");
+            }
+            else
+            {
+                Log.LogInfo($"[LifePMC] {BotOwner.name} только взаимодействие (основных точек нет)");
+            }
         }
 
         public override void Stop()
         {
+            ReleaseInteractSlot();
             BotStatusMap.Remove(BotOwner.name);
+        }
+
+        /// <summary>
+        /// Освобождает слот взаимодействия для этого бота.
+        /// Вызывается при: бой (слой деактивирован), смерть бота, завершение задания.
+        /// После боя BigBrain создаст новый Start() — бот снова займёт слот если доступен.
+        /// </summary>
+        private void ReleaseInteractSlot()
+        {
+            if (_interactReserved && _interactPoint != null)
+            {
+                PointLoader.ReleaseInteract(_interactPoint.Id, BotOwner.name);
+                _interactReserved = false;
+            }
         }
 
         // ════════════════════════════════════════════════════════════════════════
@@ -138,7 +223,8 @@ namespace LifePMC
                 float elapsed = Time.time - _startTime;
                 if (elapsed > LifePMCConfig.ObjectiveTimeout.Value)
                 {
-                    Log.LogWarning($"[LifePMC] {BotOwner.name} ТАЙМАУТ [{_point.ZoneName}] " +
+                    string targetName = _point?.ZoneName ?? _interactPoint?.Description ?? "?";
+                    Log.LogWarning($"[LifePMC] {BotOwner.name} ТАЙМАУТ [{targetName}] " +
                                    $"({elapsed:F0}с / {LifePMCConfig.ObjectiveTimeout.Value:F0}с)");
                     Complete(false);
                     return;
@@ -146,14 +232,339 @@ namespace LifePMC
 
                 switch (_phase)
                 {
-                    case Phase.Navigate: UpdateNavigate(elapsed); break;
-                    case Phase.Wander:   UpdateWander();          break;
+                    case Phase.Interact:  UpdateInteract(elapsed);  break;
+                    case Phase.Navigate:  UpdateNavigate(elapsed);  break;
+                    case Phase.Wander:    UpdateWander();           break;
                 }
             }
             catch (Exception ex)
             {
                 Log.LogError($"[LifePMC] Update exception ({BotOwner?.name}): {ex.Message}\n{ex.StackTrace}");
                 Complete(false);
+            }
+        }
+
+        // ────────────────────────────────────────────────────────────────────────
+        // Phase: Interact — идём к точке взаимодействия, взаимодействуем
+        // ────────────────────────────────────────────────────────────────────────
+        private void UpdateInteract(float elapsed)
+        {
+            if (_interactPoint == null) { _phase = Phase.Navigate; return; }
+
+            float dist = Vector3.Distance(BotOwner.Position, _interactPoint.Position);
+
+            if (Time.time - _lastDistLogTime > DIST_LOG_INTERVAL)
+            {
+                _lastDistLogTime = Time.time;
+                Log.LogInfo($"[LifePMC] {BotOwner.name} [!] → [{_interactPoint.Description}]  " +
+                            $"dist={dist:F1}м  elapsed={elapsed:F0}с");
+            }
+
+            // Анти-застрев
+            if (CheckStuck(dist, REACH_DIST)) return;
+
+            if (dist < REACH_DIST)
+            {
+                // Попытка взаимодействия
+                bool ok = TryInteractWithObject(_interactPoint.Position, _interactPoint.SearchRadius);
+                if (ok)
+                {
+                    Log.LogInfo($"[LifePMC] ✓ {BotOwner.name} ВЗАИМОДЕЙСТВОВАЛ с [{_interactPoint.Description}]");
+                    if (_interactPoint.OneShot)
+                        PointLoader.MarkInteractTriggered(_interactPoint.Id);
+                }
+                else
+                {
+                    Log.LogWarning($"[LifePMC] {BotOwner.name} не нашёл интерактивный объект у [{_interactPoint.Description}]  " +
+                                   $"(r={_interactPoint.SearchRadius:F1}м)");
+                }
+
+                // Переходим к основному заданию (или завершаем если основных точек нет)
+                if (_point != null)
+                {
+                    _phase           = Phase.Navigate;
+                    _lastGoToTime    = -999f;
+                    _lastDistLogTime = -999f;
+                    _lastPos         = BotOwner.Position;
+                    _lastPosTime     = Time.time;
+                    SetStatus($"→ {_point.ZoneName}");
+                    Log.LogInfo($"[LifePMC] {BotOwner.name} продолжает к [{_point.ZoneName}]");
+                }
+                else
+                {
+                    Log.LogInfo($"[LifePMC] {BotOwner.name} взаимодействие выполнено, основных точек нет — завершаем");
+                    Complete(false);
+                }
+                return;
+            }
+
+            SendGoTo(_interactPoint.Position);
+            ApplySprintPosture();
+        }
+
+        /// <summary>
+        /// Ищет WorldInteractiveObject в радиусе searchRadius от pos и вызывает Interact().
+        /// Использует reflection для поддержки обновлений EFT без перекомпиляции.
+        /// Возвращает true если взаимодействие выполнено успешно.
+        /// </summary>
+        private bool TryInteractWithObject(Vector3 pos, float searchRadius)
+        {
+            try
+            {
+                // ── Способ 1: точное имя GameObject (записано через WIOPatch в PointEditor) ──
+                // ВАЖНО: на карте может быть несколько GO с одним именем (напр. несколько рубильников).
+                // Проверяем расстояние — берём только тот что в пределах searchRadius*4 от точки.
+                string targetName = _interactPoint.TargetName ?? "";
+                if (!string.IsNullOrEmpty(targetName))
+                {
+                    // Ищем среди ВСЕХ GO с этим именем ближайший к позиции interact-точки
+                    GameObject bestNamed  = null;
+                    float      bestDist   = float.MaxValue;
+                    float      maxAllowed = searchRadius * 4f;
+
+                    // FindObjectsOfType слишком дорого; используем сферу большого радиуса
+                    Collider[] wideHits = Physics.OverlapSphere(pos, maxAllowed, ~0, QueryTriggerInteraction.Collide);
+                    var seenIds = new HashSet<int>();
+                    foreach (var col in wideHits)
+                    {
+                        if (col == null) continue;
+                        Transform t = col.transform;
+                        while (t != null)
+                        {
+                            if (seenIds.Add(t.gameObject.GetInstanceID())
+                                && t.gameObject.name == targetName)
+                            {
+                                float d = Vector3.Distance(pos, t.position);
+                                if (d < bestDist) { bestDist = d; bestNamed = t.gameObject; }
+                            }
+                            t = t.parent;
+                        }
+                    }
+
+                    Log.LogInfo($"[LifePMC] {BotOwner.name} Поиск по имени [{targetName}] в r={maxAllowed:F0}м → " +
+                                (bestNamed != null
+                                    ? $"НАЙДЕН  dist={bestDist:F1}м  pos={bestNamed.transform.position}"
+                                    : "НЕ НАЙДЕН в радиусе"));
+
+                    if (bestNamed != null)
+                    {
+                        // Пробуем сам GO и его родителей
+                        Transform tr = bestNamed.transform;
+                        while (tr != null)
+                        {
+                            if (TryInteractGO(tr.gameObject)) return true;
+                            tr = tr.parent;
+                        }
+                        Log.LogWarning($"[LifePMC] {BotOwner.name} GO [{targetName}] найден (dist={bestDist:F1}м), " +
+                                       "но Interact() не сработал — пробую сферу");
+                        // НЕ возвращаем false — fallthrough к сфере
+                    }
+                    // Fallthrough: объект не найден по имени / interact провалился — пробуем сферой
+                }
+
+                // ── Способ 2: Physics.OverlapSphere (fallback если имя не задано / не найдено) ──
+                // ~0 = все слои; QueryTriggerInteraction.Collide = включая триггеры
+                Collider[] hits = Physics.OverlapSphere(pos, searchRadius, ~0, QueryTriggerInteraction.Collide);
+                Log.LogInfo($"[LifePMC] {BotOwner.name} TryInteract сфера: pos={pos}  " +
+                            $"r={searchRadius}м  коллайдеров={hits.Length}");
+
+                // Собираем все уникальные GO + родителей
+                // (WorldInteractiveObject обычно висит на родителе коллайдера)
+                var checkedGoIds = new HashSet<int>();
+                var goList       = new List<GameObject>();
+
+                foreach (var col in hits)
+                {
+                    if (col == null) continue;
+                    Transform t = col.transform;
+                    while (t != null)
+                    {
+                        if (checkedGoIds.Add(t.gameObject.GetInstanceID()))
+                            goList.Add(t.gameObject);
+                        t = t.parent;
+                    }
+                }
+                Log.LogInfo($"[LifePMC] {BotOwner.name}   уникальных GO={goList.Count}");
+
+                // Диагностика: все уникальные типы MonoBehaviour-компонентов в сфере
+                var allTypes = new HashSet<string>();
+                foreach (var go in goList)
+                    foreach (var c in go.GetComponents<MonoBehaviour>())
+                        if (c != null) allTypes.Add(c.GetType().Name);
+                Log.LogInfo($"[LifePMC] {BotOwner.name}   типы компонентов: {string.Join(", ", allTypes)}");
+
+                foreach (var go in goList)
+                    if (TryInteractGO(go)) return true;
+            }
+            catch (Exception ex)
+            {
+                Log.LogWarning($"[LifePMC] TryInteractWithObject exception: {ex.Message}");
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// Пытается вызвать Interact() на MonoBehaviour с Operatable=true
+        /// на конкретном GameObject.
+        /// Если Operatable не найден — пробует любой метод Interact(1 arg).
+        /// Возвращает true при успехе.
+        /// </summary>
+        private bool TryInteractGO(GameObject go)
+        {
+            if (go == null) return false;
+
+            MonoBehaviour[] components = go.GetComponents<MonoBehaviour>();
+            if (components == null) return false;
+
+            // ── Проход 1: ищем компонент с Operatable=true ──
+            // ВАЖНО: Operatable — это ПОЛЕ (public bool Operatable = true),
+            // а не property! Используем GetField + FlattenHierarchy.
+            foreach (var comp in components)
+            {
+                if (comp == null) continue;
+                var compType = comp.GetType();
+
+                // Operatable объявлен в WorldInteractiveObject — нужен FlattenHierarchy
+                FieldInfo opField;
+                try
+                {
+                    opField = compType.GetField("Operatable",
+                        BindingFlags.Public | BindingFlags.Instance | BindingFlags.FlattenHierarchy);
+                }
+                catch { continue; }
+                if (opField == null) continue;
+
+                bool operable;
+                try { operable = (bool)opField.GetValue(comp); }
+                catch { continue; }
+
+                Log.LogInfo($"[LifePMC]   Operatable={operable}  go={go.name}  comp={compType.Name}");
+                if (!operable) continue;
+
+                if (CallInteract(comp, compType, go.name)) return true;
+            }
+
+            // ── Проход 2: ищем любой Interact(1 arg) если Operatable не нашли ──
+            // (на случай если свойство переименовано в данной версии EFT)
+            foreach (var comp in components)
+            {
+                if (comp == null) continue;
+                var compType = comp.GetType();
+
+                MethodInfo m;
+                try
+                {
+                    m = compType.GetMethods(BindingFlags.Public | BindingFlags.Instance)
+                                .FirstOrDefault(x => x.Name == "Interact" && x.GetParameters().Length == 1);
+                }
+                catch { continue; }
+                if (m == null) continue;
+
+                Log.LogInfo($"[LifePMC]   [fallback] нашёл Interact без Operatable: " +
+                            $"go={go.name}  comp={compType.Name}  " +
+                            $"param={m.GetParameters()[0].ParameterType.Name}");
+
+                if (CallInteract(comp, compType, go.name)) return true;
+            }
+
+            return false;
+        }
+
+        /// <summary>Вызывает Interact(InteractionResult) через reflection. true = успех.</summary>
+        private bool CallInteract(MonoBehaviour comp, Type compType, string goName)
+        {
+            MethodInfo interactMethod;
+            try
+            {
+                interactMethod = compType.GetMethods(BindingFlags.Public | BindingFlags.Instance)
+                                         .FirstOrDefault(m => m.Name == "Interact"
+                                                           && m.GetParameters().Length == 1);
+            }
+            catch { return false; }
+            if (interactMethod == null) return false;
+
+            var parameters = interactMethod.GetParameters();
+            var paramType  = parameters[0].ParameterType;
+
+            // Строим аргумент для Interact(InteractionResult).
+            // ВАЖНО: InteractionResult — это CLASS (не struct), IsValueType=false,
+            // поэтому строим через конструктор независимо от типа.
+            object arg = null;
+            try
+            {
+                bool argBuilt = false;
+                foreach (var ctor in paramType.GetConstructors())
+                {
+                    var ctorParams = ctor.GetParameters();
+                    if (ctorParams.Length == 1 && ctorParams[0].ParameterType.IsEnum)
+                    {
+                        var enumType  = ctorParams[0].ParameterType;
+                        var enumNames = Enum.GetNames(enumType);
+                        Log.LogInfo($"[LifePMC]   EInteractionType: {string.Join(", ", enumNames)}");
+                        object enumVal = null;
+                        // EInteractionType: Open, Close, Unlock, Breach, Lock, GoIn, GoOut
+                        // Для рубильника нужен Open. "Switch" в enum НЕ существует.
+                        foreach (var name in new[] { "Open", "Unlock" })
+                        {
+                            if (Array.IndexOf(enumNames, name) >= 0)
+                            { enumVal = Enum.Parse(enumType, name); break; }
+                        }
+                        if (enumVal == null && enumNames.Length > 0)
+                            enumVal = Enum.Parse(enumType, enumNames[0]);
+                        if (enumVal != null)
+                        {
+                            arg = ctor.Invoke(new object[] { enumVal });
+                            argBuilt = true;
+                            Log.LogInfo($"[LifePMC]   arg: {enumVal}  тип={paramType.Name}");
+                        }
+                        break;
+                    }
+                }
+                if (!argBuilt && paramType.IsValueType)
+                    arg = Activator.CreateInstance(paramType);
+            }
+            catch (Exception ex)
+            {
+                Log.LogWarning($"[LifePMC]   ошибка построения arg: {ex.Message}");
+                arg = null;
+            }
+
+            // Устанавливаем InteractingPlayer перед Interact() —
+            // WorldInteractiveObject.method_3() обращается к InteractingPlayer.ProfileId
+            // (итерирует TriggersMap), и если InteractingPlayer=null → NullReferenceException
+            try
+            {
+                var ipProp = compType.GetProperty("InteractingPlayer",
+                    BindingFlags.Public | BindingFlags.Instance | BindingFlags.FlattenHierarchy);
+                if (ipProp != null && ipProp.CanWrite)
+                {
+                    var botPlayer = BotOwner.GetPlayer;
+                    if (botPlayer != null)
+                    {
+                        ipProp.SetValue(comp, botPlayer);
+                        Log.LogInfo($"[LifePMC]   InteractingPlayer → {botPlayer.ProfileId}");
+                    }
+                }
+            }
+            catch (Exception exIp)
+            {
+                Log.LogWarning($"[LifePMC]   InteractingPlayer set: {exIp.Message}");
+            }
+
+            try
+            {
+                interactMethod.Invoke(comp, new object[] { arg });
+                Log.LogInfo($"[LifePMC] ✓ {BotOwner.name} Interact() → {goName} ({compType.Name})");
+                return true;
+            }
+            catch (Exception ex)
+            {
+                var inner = ex.InnerException ?? ex;
+                Log.LogWarning($"[LifePMC]   Interact() на {goName} ({compType.Name}): " +
+                               $"{inner.GetType().Name}: {inner.Message}");
+                if (inner.StackTrace != null)
+                    Log.LogWarning($"[LifePMC]   Stack: {inner.StackTrace.Split('\n')[0].Trim()}");
+                return false;
             }
         }
 
@@ -585,6 +996,7 @@ namespace LifePMC
         {
             _phase = Phase.Done;
             try { BotOwner?.Mover?.Sprint(false); } catch { }
+            ReleaseInteractSlot();
             BotStatusMap.Remove(BotOwner.name);
             _layer?.OnObjectiveComplete(wasStuck);
         }

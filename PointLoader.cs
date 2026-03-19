@@ -45,13 +45,80 @@ namespace LifePMC
     }
 
     // ─────────────────────────────────────────────────────────────────────────
+    // Точка взаимодействия — рубильник, дверь, кнопка и т.п.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    public class InteractPoint
+    {
+        [JsonProperty("id")]            public string Id           { get; set; }
+        [JsonProperty("map")]           public string Map          { get; set; }
+        [JsonProperty("description")]   public string Description  { get; set; } = "";
+        [JsonProperty("x")]             public float  X            { get; set; }
+        [JsonProperty("y")]             public float  Y            { get; set; }
+        [JsonProperty("z")]             public float  Z            { get; set; }
+        [JsonProperty("search_radius")] public float  SearchRadius { get; set; } = 3f;
+        /// <summary>true = только первый бот за рейд взаимодействует.</summary>
+        [JsonProperty("one_shot")]      public bool   OneShot      { get; set; } = true;
+        /// <summary>
+        /// Имя GameObject-а целевого объекта (записывается в PointEditor когда
+        /// игрок сам взаимодействует). Если задано — боты ищут по имени (точно).
+        /// </summary>
+        [JsonProperty("target_name")]   public string TargetName   { get; set; } = "";
+        [JsonIgnore] public Vector3 Position => new Vector3(X, Y, Z);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
     // Статический загрузчик
     // ─────────────────────────────────────────────────────────────────────────
 
     public static class PointLoader
     {
-        private static List<QuestPoint> _points    = new List<QuestPoint>();
-        private static List<SubPoint>   _subPoints = new List<SubPoint>();
+        private static List<QuestPoint>    _points        = new List<QuestPoint>();
+        private static List<SubPoint>      _subPoints     = new List<SubPoint>();
+        private static List<InteractPoint> _interactPoints = new List<InteractPoint>();
+
+        /// <summary>ID точек взаимодействия которые уже были выполнены в этом рейде.</summary>
+        private static readonly HashSet<string> _triggeredInteractIds =
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        // ── Слоты взаимодействия ─────────────────────────────────────────────
+        // interactId → набор имён ботов, которые зарезервировали слот.
+        // Максимум MaxInteractSlots ботов одновременно идут к одной точке.
+        private static readonly Dictionary<string, HashSet<string>> _interactSlots =
+            new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
+
+        public static int MaxInteractSlots => LifePMCConfig.MaxInteractBots.Value;
+
+        /// <summary>
+        /// Бот пытается зарезервировать слот для interact-точки.
+        /// Возвращает true если слот занят (или уже был занят этим ботом),
+        /// false если все слоты заняты другими ботами.
+        /// </summary>
+        public static bool TryReserveInteract(string interactId, string botName)
+        {
+            if (!_interactSlots.TryGetValue(interactId, out var set))
+            {
+                set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                _interactSlots[interactId] = set;
+            }
+            if (set.Contains(botName)) return true;   // уже наш слот
+            if (set.Count >= MaxInteractSlots) return false; // все заняты
+            set.Add(botName);
+            Plugin.Log.LogInfo($"[LifePMC] 🔒 Слот [{interactId}]: {botName} " +
+                               $"(занято {set.Count}/{MaxInteractSlots})");
+            return true;
+        }
+
+        /// <summary>Освобождает слот бота (бой, смерть, выполнение).</summary>
+        public static void ReleaseInteract(string interactId, string botName)
+        {
+            if (_interactSlots.TryGetValue(interactId, out var set) && set.Remove(botName))
+                Plugin.Log.LogInfo($"[LifePMC] 🔓 Слот [{interactId}]: {botName} освобождён " +
+                                   $"(осталось {set.Count}/{MaxInteractSlots})");
+        }
+
+        public static int GetInteractSlotCount(string interactId) =>
+            _interactSlots.TryGetValue(interactId, out var set) ? set.Count : 0;
 
         public static bool IsLoaded { get; private set; }
         public static List<QuestPoint> GetPoints() => _points;
@@ -60,6 +127,9 @@ namespace LifePMC
         {
             _points.Clear();
             _subPoints.Clear();
+            _interactPoints.Clear();
+            _triggeredInteractIds.Clear();
+            _interactSlots.Clear();
             IsLoaded = false;
 
             Plugin.Log.LogInfo($"[LifePMC] ── Загрузка данных для карты '{mapId}' ──");
@@ -119,16 +189,42 @@ namespace LifePMC
                 Plugin.Log.LogInfo($"[LifePMC] Саб-точек нет ({sPath})");
             }
 
+            // ── Точки взаимодействия ──────────────────────────────────────────
+            string iPath = Path.Combine(saveDir, mapId + "_interact.json");
+            if (File.Exists(iPath))
+            {
+                try
+                {
+                    _interactPoints = JsonConvert.DeserializeObject<List<InteractPoint>>(File.ReadAllText(iPath))
+                                      ?? new List<InteractPoint>();
+                    Plugin.Log.LogInfo($"[LifePMC] Загружено {_interactPoints.Count} точек взаимодействия:");
+                    foreach (var ip in _interactPoints)
+                        Plugin.Log.LogInfo($"[LifePMC]   [!] {ip.Id}  \"{ip.Description}\"  " +
+                                           $"r={ip.SearchRadius:F1}м  one_shot={ip.OneShot}");
+                }
+                catch (Exception ex)
+                {
+                    Plugin.Log.LogError($"[LifePMC] ОШИБКА загрузки взаимодействий: {ex.Message}");
+                }
+            }
+            else
+            {
+                Plugin.Log.LogInfo($"[LifePMC] Точек взаимодействия нет ({iPath})");
+            }
+
             IsLoaded = true;
-            Plugin.Log.LogInfo($"[LifePMC] Загрузка завершена. Точек={_points.Count}  Саб={_subPoints.Count}");
+            Plugin.Log.LogInfo($"[LifePMC] Загрузка завершена. Точек={_points.Count}  Саб={_subPoints.Count}  Взаим={_interactPoints.Count}");
             Plugin.Log.LogInfo($"[LifePMC] ──────────────────────────────────────────");
         }
 
         public static void Reset()
         {
-            Plugin.Log.LogInfo($"[LifePMC] PointLoader сброшен (было {_points.Count} точек, {_subPoints.Count} саб)");
+            Plugin.Log.LogInfo($"[LifePMC] PointLoader сброшен (было {_points.Count} точек, {_subPoints.Count} саб, {_interactPoints.Count} взаим)");
             _points.Clear();
             _subPoints.Clear();
+            _interactPoints.Clear();
+            _triggeredInteractIds.Clear();
+            _interactSlots.Clear();
             IsLoaded = false;
         }
 
@@ -144,6 +240,26 @@ namespace LifePMC
             if (string.IsNullOrEmpty(pointId)) return new List<SubPoint>();
             return _subPoints.FindAll(s =>
                 string.Equals(s.ParentId, pointId, StringComparison.OrdinalIgnoreCase));
+        }
+
+        /// <summary>
+        /// Возвращает список доступных точек взаимодействия.
+        /// Для one_shot-точек — только ещё не выполненные в этом рейде.
+        /// </summary>
+        public static List<InteractPoint> GetInteractPoints()
+        {
+            return _interactPoints.FindAll(ip =>
+                !ip.OneShot || !_triggeredInteractIds.Contains(ip.Id));
+        }
+
+        /// <summary>Помечает one_shot-точку как выполненную для текущего рейда.</summary>
+        public static void MarkInteractTriggered(string id)
+        {
+            if (!string.IsNullOrEmpty(id))
+            {
+                _triggeredInteractIds.Add(id);
+                _interactSlots.Remove(id);  // снимаем все резервации — точка выполнена
+            }
         }
     }
 }
